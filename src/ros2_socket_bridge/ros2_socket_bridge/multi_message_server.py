@@ -6,7 +6,7 @@ import zmq
 from threading import Thread
 
 from rclpy.node import Node
-from std_msgs.msg import String
+from std_msgs.msg import String, Float32, UInt8
 from nav_msgs.msg import Odometry 
 from geometry_msgs.msg import PoseWithCovarianceStamped
 from sensor_msgs.msg import Imu
@@ -15,45 +15,46 @@ from sensor_msgs.msg import Imu
 class MultiMessageServerNode(Node):
     def __init__(self):
         super().__init__('multi_message_server_node')
-
+        
+        # Queue
         self.message_queue = queue.Queue(maxsize=16)
 
+        # ZMQ
         context = zmq.Context()
-
         self.send_socket = context.socket(zmq.PAIR)
         self.send_socket.bind(f"tcp://*:7010")
-        
         self.recieve_socket = context.socket(zmq.PAIR)
         self.recieve_socket.bind(f"tcp://*:7011")
-        self.recieve_socket.RCVTIMEO = 5000  # Milliseconds
+        self.recieve_socket.RCVTIMEO = 10  # Milliseconds
 
-        self.string_subscriber = self.create_subscription(String, '/string', self.string_callback, 10)
-        self.odom_subscriber = self.create_subscription(Odometry, '/odometry', self.odometry_callback, 10)
-        self.pose_subscriber = self.create_subscription(PoseWithCovarianceStamped, '/pose', self.pose_callback, 10)
-        self.imu_subscriber = self.create_subscription(Imu, '/imu', self.imu_callback, 10)
+        # Topics
+        self.uint8_topic = '/uint8'
+        self.float32_topic = '/float32'
+        self.string_topic = "/string"
+        self.odom_topic = "/odometry"
+        self.pose_topic = "/pose"
+        self.imu_topic = "/imu"
 
-        self.send_loop_running = False
-        self.send_loop_thread = Thread(target=self.send_loop)
+        # Subscribers
+        self.string_subscriber = self.create_subscription(String, self.string_topic, self.string_callback, 10)
+        self.odom_subscriber = self.create_subscription(Odometry, self.odom_topic, self.odometry_callback, 10)
+        self.pose_subscriber = self.create_subscription(PoseWithCovarianceStamped, self.pose_topic, self.pose_callback, 10)
+        self.imu_subscriber = self.create_subscription(Imu, self.imu_topic, self.imu_callback, 10)
 
-        self.recieve_loop_running = False
-        self.recieve_loop_thread = Thread(target=self.recieve_loop)
+        # Publishers
+        self.uint8_publisher = self.create_publisher(UInt8, self.uint8_topic, 10)
+        self.float32_publisher = self.create_publisher(Float32, self.float32_topic, 10)
 
-    def start(self, ):
-        self.send_loop_running = True
-        self.recieve_loop_running = True
-
-        self.send_loop_thread.start()
-        self.recieve_loop_thread.start()
-
-    def stop(self, ):
-        self.send_loop_running = False
-        self.recieve_loop_running = False
-
-        self.send_loop_thread.join()        
-        self.recieve_loop_thread.join()
+        # Timers
+        self.send_loop_lock = False
+        self.recieve_loop_lock = False
+        self.send_loop_timer = self.create_timer(0.002, self.send_loop)
+        self.recieve_loop_timer = self.create_timer(0.002, self.recieve_loop)
 
     def send_loop(self, ):
-        while self.send_loop_running:  # Where is the equivalent to rospy.is_shutdown()?
+        if not self.send_loop_lock:  
+            self.send_loop_lock = True
+
             try:
                 queue_data = self.message_queue.get(timeout=0.001)
                 self.send_socket.send(queue_data)
@@ -63,14 +64,42 @@ class MultiMessageServerNode(Node):
 
             except Exception as e:
                 self.get_logger().info(e)
+            
+            self.send_loop_lock = False
 
     def recieve_loop(self, ):
-        # TODO: something useful
-        pass
+        if not self.recieve_loop_lock:
+            self.recieve_loop_lock = True
+            
+            try:
+                message_dict = pickle.loads(self.recieve_socket.recv())
+                
+                if message_dict["topic"] == self.uint8_topic:
+                    string_thread = Thread(target=self.publish_uint8_msg, args=(message_dict["payload"], ))
+                    string_thread.start()
+
+                elif message_dict["topic"] == self.float32_topic:
+                    odometry_thread = Thread(target=self.publish_float32_msg, args=(message_dict["payload"], ))
+                    odometry_thread.start()
+
+            except Exception as e:
+                if "Resource temporarily unavailable" in str(e):  # Need to set a timeout or the script hangs on the .recv() method
+                    pass
+
+                else:
+                    self.get_logger().info(str(e))
+
+            self.recieve_loop_lock = False
+       
+    def publish_uint8_msg(self, msg):
+        self.uint8_publisher.publish(msg) 
+
+    def publish_float32_msg(self, msg):
+        self.float32_publisher.publish(msg)
 
     def string_callback(self, msg):
         try:
-            self.message_queue.put(pickle.dumps({"topic": "/string", "payload": msg}), block=False)
+            self.message_queue.put(pickle.dumps({"topic": self.string_topic, "payload": msg}), block=False)
 
         except queue.Full:
             self.get_logger().info('Queue Full')
@@ -80,7 +109,7 @@ class MultiMessageServerNode(Node):
 
     def odometry_callback(self, msg):
         try:
-            self.message_queue.put(pickle.dumps({"topic": "/odometry", "payload": msg}), block=False)
+            self.message_queue.put(pickle.dumps({"topic": self.odom_topic, "payload": msg}), block=False)
 
         except queue.Full:
             self.get_logger().info('Queue Full')
@@ -90,7 +119,7 @@ class MultiMessageServerNode(Node):
 
     def pose_callback(self, msg):
         try:
-            self.message_queue.put(pickle.dumps({"topic": "/pose", "payload": msg}), block=False)
+            self.message_queue.put(pickle.dumps({"topic": self.pose_topic, "payload": msg}), block=False)
         
         except queue.Full:
             self.get_logger().info('Queue Full')
@@ -100,7 +129,7 @@ class MultiMessageServerNode(Node):
 
     def imu_callback(self, msg):
         try:
-            self.message_queue.put(pickle.dumps({"topic": "/imu", "payload": msg}), block=False)
+            self.message_queue.put(pickle.dumps({"topic": self.imu_topic, "payload": msg}), block=False)
         
         except queue.Full:
             self.get_logger().info('Queue Full')
@@ -113,11 +142,9 @@ def main(args=None):
     rclpy.init(args=args)
 
     multi_message_server_node = MultiMessageServerNode()
-    multi_message_server_node.start()
 
     rclpy.spin(multi_message_server_node)
 
-    multi_message_server_node.stop()
     multi_message_server_node.destroy_node()
 
     rclpy.shutdown()
